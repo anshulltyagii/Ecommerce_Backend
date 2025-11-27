@@ -1,4 +1,4 @@
-  package com.ecommerce.service.impl;
+package com.ecommerce.service.impl;
 
 import com.ecommerce.dto.CartResponse;
 import com.ecommerce.dto.OrderItemResponse;
@@ -14,30 +14,47 @@ import com.ecommerce.model.OrderItem;
 import com.ecommerce.repository.CouponRepository;
 import com.ecommerce.repository.OrderRepository;
 import com.ecommerce.service.CartService;
+import com.ecommerce.service.InventoryService;
 import com.ecommerce.service.OrderService;
-import org.springframework.beans.factory.annotation.Autowired;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * DEFINITIVE OrderServiceImpl
+ * 
+ * Inventory Flow:
+ * 1. CHECKOUT      → reserveStock()
+ * 2. CONFIRMED     → consumeReservedOnOrder()
+ * 3. CANCEL        → releaseReserved() (if unpaid) OR addStock() (if paid)
+ */
 @Service
 public class OrderServiceImpl implements OrderService {
 
-    @Autowired
-    private CartService cartService;
+    private static final Logger log = LoggerFactory.getLogger(OrderServiceImpl.class);
 
-    @Autowired
-    private OrderRepository orderRepository;
+    private final CartService cartService;
+    private final OrderRepository orderRepository;
+    private final CouponRepository couponRepository;
+    private final InventoryService inventoryService;
 
-    @Autowired
-    private CouponRepository couponRepository;
-    
-    // InventoryService removed temporarily
+    public OrderServiceImpl(CartService cartService,
+                           OrderRepository orderRepository,
+                           CouponRepository couponRepository,
+                           InventoryService inventoryService) {
+        this.cartService = cartService;
+        this.orderRepository = orderRepository;
+        this.couponRepository = couponRepository;
+        this.inventoryService = inventoryService;
+    }
 
     // ========================================================================
     // 1. PLACE ORDER (CHECKOUT)
@@ -45,8 +62,9 @@ public class OrderServiceImpl implements OrderService {
     @Override
     @Transactional
     public List<Order> placeOrder(Long userId, OrderRequest request) {
+        log.info("Placing order for userId: {}", userId);
 
-        // A. Fetch Cart Data
+        // A. Fetch Cart
         CartResponse cartResponse = cartService.getUserCart(userId);
         Map<Long, List<CartItem>> itemsByShop = cartResponse.getItemsByShop();
 
@@ -54,114 +72,99 @@ public class OrderServiceImpl implements OrderService {
             throw new BadRequestException("Cannot place order: Cart is empty");
         }
 
-        // B. Validate Coupon
+        // B. Validate Address
+        if (request.getShippingAddress() == null || request.getShippingAddress().trim().isEmpty()) {
+            throw new BadRequestException("Shipping address is required");
+        }
+
+        // C. Validate Coupon
         Coupon coupon = null;
         if (request.getCouponCode() != null && !request.getCouponCode().trim().isEmpty()) {
-            coupon = couponRepository.findByCode(request.getCouponCode())
-                    .orElseThrow(() -> new ResourceNotFoundException("Invalid Coupon Code"));
-
-            if (coupon.getValidTo() != null && coupon.getValidTo().isBefore(LocalDate.now())) {
-                throw new BadRequestException("Coupon has expired");
-            }
-            if (couponRepository.isUsedByUser(userId, coupon.getId())) {
-                throw new BadRequestException("You have already used this coupon");
-            }
+            coupon = validateCoupon(request.getCouponCode(), userId);
         }
 
         List<Order> createdOrders = new ArrayList<>();
+        List<ReservedItem> allReservedItems = new ArrayList<>(); 
         boolean globalCouponUsed = false;
 
-        // C. Loop through shops to create Split Orders
-        for (Map.Entry<Long, List<CartItem>> entry : itemsByShop.entrySet()) {
-            Long shopId = entry.getKey();
-            List<CartItem> shopItems = entry.getValue();
+        try {
+            // D. Process Each Shop
+            for (Map.Entry<Long, List<CartItem>> entry : itemsByShop.entrySet()) {
+                Long shopId = entry.getKey();
+                List<CartItem> shopItems = entry.getValue();
 
-            // Inventory Check removed here
+                // *** RESERVE INVENTORY ***
+                for (CartItem item : shopItems) {
+                    log.debug("Reserving {} units of product {} for shop {}", item.getQuantity(), item.getProductId(), shopId);
+                    inventoryService.reserveStock(item.getProductId(), item.getQuantity());
+                    allReservedItems.add(new ReservedItem(item.getProductId(), item.getQuantity()));
+                }
 
-            // 1. Calculate Total for this shop
-            BigDecimal shopTotal = shopItems.stream()
-                    .map(item -> item.getPriceAtAdd().multiply(new BigDecimal(item.getQuantity())))
-                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+                // Calculate Totals & Coupons
+                BigDecimal shopTotal = calculateShopTotal(shopItems);
+                BigDecimal finalAmount = shopTotal;
+                boolean couponAppliedToThisOrder = false;
 
-            // 2. Apply Coupon Logic
-            BigDecimal finalAmount = shopTotal;
-            boolean couponAppliedToThisOrder = false;
-
-            if (coupon != null) {
-                // Case A: Shop-Specific Coupon
-                if (coupon.getShopId() != null && coupon.getShopId().equals(shopId)) {
-                    if (shopTotal.compareTo(coupon.getMinOrderAmount()) >= 0) {
-                        finalAmount = applyDiscount(shopTotal, coupon);
+                if (coupon != null) {
+                    CouponResult couponResult = applyCouponToShop(coupon, shopId, shopTotal, globalCouponUsed);
+                    if (couponResult.applied) {
+                        finalAmount = couponResult.discountedAmount;
                         couponAppliedToThisOrder = true;
+                        if (coupon.getShopId() == null) {
+                            globalCouponUsed = true;
+                        }
                     }
                 }
-                // Case B: Global Coupon (Apply once)
-                else if (coupon.getShopId() == null && !globalCouponUsed) {
-                    if (shopTotal.compareTo(coupon.getMinOrderAmount()) >= 0) {
-                        finalAmount = applyDiscount(shopTotal, coupon);
-                        couponAppliedToThisOrder = true;
-                        globalCouponUsed = true;
-                    }
+
+                // Create & Save Order
+                Order order = createOrder(userId, shopId, finalAmount, request.getShippingAddress());
+                Order savedOrder = orderRepository.save(order);
+
+                // Create & Save Order Items
+                List<OrderItem> orderItems = createOrderItems(savedOrder.getId(), shopItems);
+                orderRepository.saveOrderItems(orderItems);
+
+                // Record Coupon Usage
+                if (couponAppliedToThisOrder && coupon != null) {
+                    couponRepository.recordUsage(userId, coupon.getId(), savedOrder.getId());
+                }
+
+                createdOrders.add(savedOrder);
+            }
+
+            // E. Clear Cart
+            cartService.clearCart(userId);
+            return createdOrders;
+
+        } catch (Exception e) {
+            // ROLLBACK RESERVATIONS ON FAILURE
+            log.error("Order placement failed, rolling back reservations", e);
+            for (ReservedItem reserved : allReservedItems) {
+                try {
+                    inventoryService.releaseReserved(reserved.productId, reserved.quantity);
+                } catch (Exception rollbackEx) {
+                    log.error("Failed to release reservation for product {}", reserved.productId);
                 }
             }
-
-            // 3. Create Order Object
-            Order order = new Order();
-            order.setUserId(userId);
-            order.setShopId(shopId);
-            order.setShippingAddress(request.getShippingAddress());
-            order.setTotalAmount(finalAmount);
-            order.setOrderNumber("ORD-" + System.currentTimeMillis() + "-" + shopId);
-            
-            // 4. Save Order
-            Order savedOrder = orderRepository.save(order);
-
-            // 5. Create Order Items
-            List<OrderItem> orderItems = new ArrayList<>();
-            for (CartItem ci : shopItems) {
-                
-                // Inventory Reduction removed here
-
-                BigDecimal lineTotal = ci.getPriceAtAdd().multiply(new BigDecimal(ci.getQuantity()));
-                orderItems.add(new OrderItem(
-                        savedOrder.getId(),
-                        ci.getProductId(),
-                        ci.getQuantity(),
-                        ci.getPriceAtAdd(),
-                        lineTotal
-                ));
-            }
-            orderRepository.saveOrderItems(orderItems);
-
-            // 6. Record Coupon Usage
-            if (couponAppliedToThisOrder && coupon != null) {
-                couponRepository.recordUsage(userId, coupon.getId(), savedOrder.getId());
-            }
-
-            createdOrders.add(savedOrder);
+            throw e; 
         }
-
-        // D. Clear Cart
-        cartService.clearCart(userId);
-
-        return createdOrders;
     }
 
     // ========================================================================
-    // 2. USER HISTORY
+    // 2. GET HISTORY
     // ========================================================================
     @Override
     public List<OrderResponse> getUserOrders(Long userId) {
         List<Order> orders = orderRepository.findByUserId(userId);
         List<OrderResponse> responseList = new ArrayList<>();
         for (Order order : orders) {
-            responseList.add(mapToResponse(order, null)); 
+            responseList.add(mapToResponse(order, null));
         }
         return responseList;
     }
 
     // ========================================================================
-    // 3. ORDER DETAILS
+    // 3. GET DETAILS
     // ========================================================================
     @Override
     public OrderResponse getOrderDetails(Long orderId) {
@@ -172,26 +175,41 @@ public class OrderServiceImpl implements OrderService {
     }
 
     // ========================================================================
-    // 4. CANCEL ORDER (USER)
+    // 4. CANCEL ORDER
     // ========================================================================
     @Override
     @Transactional
     public void cancelOrder(Long orderId) {
+        log.info("Cancelling order: {}", orderId);
+        
         Order order = orderRepository.findById(orderId)
                 .orElseThrow(() -> new ResourceNotFoundException("Order not found"));
 
-        String status = order.getStatus().toUpperCase();
+        String status = order.getStatus() != null ? order.getStatus().toUpperCase() : "PLACED";
+        String paymentStatus = order.getPaymentStatus() != null ? order.getPaymentStatus().toUpperCase() : "PENDING";
+
         if ("SHIPPED".equals(status) || "DELIVERED".equals(status) || "CANCELLED".equals(status) || "RETURNED".equals(status)) {
             throw new BadRequestException("Cannot cancel order. Current status: " + status);
         }
 
-        // Inventory Restore removed here
+        List<OrderItemResponse> items = orderRepository.findItemsByOrderId(orderId);
+
+        // LOGIC: If Paid -> Refund Stock. If Reserved -> Release.
+        if ("CONFIRMED".equals(status) || "PAID".equals(paymentStatus)) {
+            for (OrderItemResponse item : items) {
+                inventoryService.addStock(item.getProductId(), item.getQuantity());
+            }
+        } else {
+            for (OrderItemResponse item : items) {
+                inventoryService.releaseReserved(item.getProductId(), item.getQuantity());
+            }
+        }
 
         orderRepository.updateOrderStatus(orderId, "CANCELLED");
     }
-    
+
     // ========================================================================
-    // 5. ADMIN: GET ALL ORDERS
+    // 5. ADMIN: GET ALL
     // ========================================================================
     @Override
     public List<OrderResponse> getAllOrders() {
@@ -212,35 +230,126 @@ public class OrderServiceImpl implements OrderService {
         Order order = orderRepository.findById(orderId)
                 .orElseThrow(() -> new ResourceNotFoundException("Order not found"));
 
-        String currentStatus = order.getStatus();
-        if ("DELIVERED".equalsIgnoreCase(currentStatus) || "CANCELLED".equalsIgnoreCase(currentStatus)) {
-            throw new BadRequestException("Cannot change status of a " + currentStatus + " order.");
+        String currentStatus = order.getStatus() != null ? order.getStatus().toUpperCase() : "PLACED";
+        String targetStatus = newStatus.toUpperCase();
+
+        validateStatusTransition(currentStatus, targetStatus);
+
+        // CONSUME STOCK ON CONFIRMATION
+        if ("CONFIRMED".equals(targetStatus) && !"CONFIRMED".equals(currentStatus)) {
+            List<OrderItemResponse> items = orderRepository.findItemsByOrderId(orderId);
+            for (OrderItemResponse item : items) {
+                inventoryService.consumeReservedOnOrder(item.getProductId(), item.getQuantity());
+            }
         }
 
-        orderRepository.updateOrderStatus(orderId, newStatus.toUpperCase());
-        order.setStatus(newStatus.toUpperCase());
+        // RESTORE STOCK ON RETURN
+        if ("RETURNED".equals(targetStatus)) {
+            List<OrderItemResponse> items = orderRepository.findItemsByOrderId(orderId);
+            for (OrderItemResponse item : items) {
+                inventoryService.addStock(item.getProductId(), item.getQuantity());
+            }
+        }
+
+        orderRepository.updateOrderStatus(orderId, targetStatus);
+        order.setStatus(targetStatus);
         return mapToResponse(order, null);
     }
 
     // ========================================================================
-    // HELPER METHODS
+    // PRIVATE HELPER METHODS
     // ========================================================================
-    
-    private BigDecimal applyDiscount(BigDecimal total, Coupon coupon) {
-        // FIX: Compare Enum correctly using ==
-        if (DiscountType.FLAT == coupon.getDiscountType()) {
-            
-            BigDecimal result = total.subtract(coupon.getDiscountValue());
-            // Ensure total doesn't go negative
-            return result.compareTo(BigDecimal.ZERO) < 0 ? BigDecimal.ZERO : result;
-            
-        } else {
-            // Percentage Logic
-            BigDecimal discountAmount = total.multiply(coupon.getDiscountValue())
-                    .divide(new BigDecimal(100));
-            BigDecimal result = total.subtract(discountAmount);
-            return result.compareTo(BigDecimal.ZERO) < 0 ? BigDecimal.ZERO : result;
+
+    private Coupon validateCoupon(String couponCode, Long userId) {
+        Coupon coupon = couponRepository.findByCode(couponCode)
+                .orElseThrow(() -> new ResourceNotFoundException("Invalid Coupon Code"));
+
+        // FIX: use isActive() instead of getIsActive()
+        if (!coupon.isActive()) {
+            throw new BadRequestException("Coupon is no longer active");
         }
+
+        LocalDate today = LocalDate.now();
+        if (coupon.getValidFrom() != null && today.isBefore(coupon.getValidFrom())) {
+            throw new BadRequestException("Coupon is not yet valid");
+        }
+        if (coupon.getValidTo() != null && today.isAfter(coupon.getValidTo())) {
+            throw new BadRequestException("Coupon has expired");
+        }
+        if (couponRepository.isUsedByUser(userId, coupon.getId())) {
+            throw new BadRequestException("You have already used this coupon");
+        }
+        return coupon;
+    }
+
+    private BigDecimal calculateShopTotal(List<CartItem> items) {
+        return items.stream()
+                .map(item -> item.getPriceAtAdd().multiply(new BigDecimal(item.getQuantity())))
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
+
+    private CouponResult applyCouponToShop(Coupon coupon, Long shopId, BigDecimal shopTotal, boolean globalCouponAlreadyUsed) {
+        CouponResult result = new CouponResult();
+        result.applied = false;
+        result.discountedAmount = shopTotal;
+
+        if (shopTotal.compareTo(coupon.getMinOrderAmount()) < 0) {
+            return result;
+        }
+
+        if (coupon.getShopId() != null) {
+            if (coupon.getShopId().equals(shopId)) {
+                result.discountedAmount = applyDiscount(shopTotal, coupon);
+                result.applied = true;
+            }
+        }
+        else if (!globalCouponAlreadyUsed) {
+            result.discountedAmount = applyDiscount(shopTotal, coupon);
+            result.applied = true;
+        }
+        return result;
+    }
+
+    private BigDecimal applyDiscount(BigDecimal total, Coupon coupon) {
+        BigDecimal result;
+        if (DiscountType.FLAT == coupon.getDiscountType()) {
+            result = total.subtract(coupon.getDiscountValue());
+        } else {
+            BigDecimal discountAmount = total
+                    .multiply(coupon.getDiscountValue())
+                    .divide(new BigDecimal(100), 2, RoundingMode.HALF_UP);
+            result = total.subtract(discountAmount);
+        }
+        return result.compareTo(BigDecimal.ZERO) < 0 ? BigDecimal.ZERO : result;
+    }
+
+    private Order createOrder(Long userId, Long shopId, BigDecimal amount, String shippingAddress) {
+        Order order = new Order();
+        order.setUserId(userId);
+        order.setShopId(shopId);
+        order.setTotalAmount(amount);
+        order.setShippingAddress(shippingAddress);
+        order.setOrderNumber("ORD-" + System.currentTimeMillis() + "-" + shopId);
+        order.setStatus("PLACED");
+        order.setPaymentStatus("PENDING");
+        return order;
+    }
+
+    private List<OrderItem> createOrderItems(Long orderId, List<CartItem> cartItems) {
+        List<OrderItem> orderItems = new ArrayList<>();
+        for (CartItem ci : cartItems) {
+            BigDecimal lineTotal = ci.getPriceAtAdd().multiply(new BigDecimal(ci.getQuantity()));
+            orderItems.add(new OrderItem(orderId, ci.getProductId(), ci.getQuantity(), ci.getPriceAtAdd(), lineTotal));
+        }
+        return orderItems;
+    }
+
+    private void validateStatusTransition(String current, String target) {
+        // Basic validation logic
+        if ("CANCELLED".equals(current) || "RETURNED".equals(current)) {
+            throw new BadRequestException("Cannot change status of " + current + " order");
+        }
+        // You can add more strict transitions here if needed
     }
 
     private OrderResponse mapToResponse(Order order, List<OrderItemResponse> items) {
@@ -255,8 +364,15 @@ public class OrderServiceImpl implements OrderService {
         dto.setItems(items);
         return dto;
     }
+
+    private static class ReservedItem {
+        Long productId;
+        int quantity;
+        ReservedItem(Long productId, int quantity) { this.productId = productId; this.quantity = quantity; }
+    }
+
+    private static class CouponResult {
+        boolean applied;
+        BigDecimal discountedAmount;
+    }
 }
-    
-
-
-
