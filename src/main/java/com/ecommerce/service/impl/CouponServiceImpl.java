@@ -8,6 +8,7 @@ import com.ecommerce.exception.BadRequestException;
 import com.ecommerce.exception.ResourceNotFoundException;
 import com.ecommerce.model.Coupon;
 import com.ecommerce.repository.CouponRepository;
+import com.ecommerce.repository.ShopRepository;
 import com.ecommerce.service.CouponService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -47,10 +48,12 @@ public class CouponServiceImpl implements CouponService {
     private static final Logger log = LoggerFactory.getLogger(CouponServiceImpl.class);
 
     private final CouponRepository couponRepository;
+    private final ShopRepository shopRepository;
 
     // Constructor Injection
-    public CouponServiceImpl(CouponRepository couponRepository) {
+    public CouponServiceImpl(CouponRepository couponRepository, ShopRepository shopRepository) {
         this.couponRepository = couponRepository;
+        this.shopRepository = shopRepository;
         log.info("CouponService initialized");
     }
 
@@ -419,6 +422,28 @@ public class CouponServiceImpl implements CouponService {
             log.error("validTo {} is before validFrom {}", validTo, validFrom);
             throw new BadRequestException("Valid To date cannot be before Valid From date");
         }
+        
+        // Edge Case: Shop ID validation (if provided)
+        if (req.getShopId() != null) {
+            validateShopExists(req.getShopId());
+        }
+    }
+    
+    /**
+     * Validate that the shop exists in the database
+     */
+    private void validateShopExists(Long shopId) {
+        if (shopId <= 0) {
+            log.error("Invalid shop ID: {}", shopId);
+            throw new BadRequestException("Invalid shop ID: " + shopId);
+        }
+        
+        // Check if shop exists in database using ShopRepository
+        if (shopRepository.getShopById(shopId).isEmpty()) {
+            log.error("Shop not found with ID: {}", shopId);
+            throw new ResourceNotFoundException("Shop not found with ID: " + shopId);
+        }
+        log.debug("Shop {} validated successfully", shopId);
     }
 
     private LocalDate parseDate(String dateStr, String fieldName) {

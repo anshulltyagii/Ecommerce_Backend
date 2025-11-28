@@ -5,11 +5,12 @@ import com.ecommerce.dto.OtpVerifyRequest;
 import com.ecommerce.exception.BadRequestException;
 import com.ecommerce.exception.ResourceNotFoundException;
 import com.ecommerce.model.OtpCode;
-import com.ecommerce.dto.EmailSendRequest;
 import com.ecommerce.repository.OtpCodeRepository;
 import com.ecommerce.service.EmailNotificationService;
 import com.ecommerce.service.OtpService;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -18,86 +19,78 @@ import java.util.Random;
 @Service
 public class OtpServiceImpl implements OtpService {
 
-    private final OtpCodeRepository otpRepo;
-    private final EmailNotificationService emailService;
+	private static final Logger log = LoggerFactory.getLogger(OtpServiceImpl.class);
 
-    public OtpServiceImpl(OtpCodeRepository otpRepo, EmailNotificationService emailService) {
-        this.otpRepo = otpRepo;
-        this.emailService = emailService;
-    }
+	private final OtpCodeRepository otpRepo;
+	private final EmailNotificationService emailService;
 
-    // ------------------------------------------------------------
-    // GENERATE OTP
-    // ------------------------------------------------------------
-    @Override
-    public String generateOtp(OtpRequest request) {
+	public OtpServiceImpl(OtpCodeRepository otpRepo, EmailNotificationService emailService) {
+		this.otpRepo = otpRepo;
+		this.emailService = emailService;
+	}
 
-        if (request.getIdentifier() == null || request.getIdentifier().trim().isEmpty()) {
-            throw new BadRequestException("Identifier cannot be empty");
-        }
+	// ------------------------------------------------------------
+	// GENERATE OTP (NOW USING LOGGER INSTEAD OF EMAIL)
+	// ------------------------------------------------------------
+	@Override
+	public String generateOtp(OtpRequest request) {
 
-        String identifier = request.getIdentifier().trim();
+		if (request.getIdentifier() == null || request.getIdentifier().trim().isEmpty()) {
+			throw new BadRequestException("Identifier cannot be empty");
+		}
 
-        // Remove all old OTPs for this identifier
-        otpRepo.deleteOldOtps(identifier);
+		String identifier = request.getIdentifier().trim();
 
-        // Generate random 4-digit OTP
-        String otp = String.valueOf(1000 + new Random().nextInt(9000));
+		// Remove old OTPs
+		otpRepo.deleteOldOtps(identifier);
 
-        OtpCode otpCode = new OtpCode();
-        otpCode.setIdentifier(identifier);
-        otpCode.setOtpCode(otp);
-        otpCode.setUsed(false);
-        otpCode.setExpiresAt(LocalDateTime.now().plusMinutes(5));  // 5 minute validity
+		// Generate 4-digit OTP
+		String otp = String.valueOf(1000 + new Random().nextInt(9000));
 
-        Long otpId = otpRepo.save(otpCode);
+		OtpCode otpCode = new OtpCode();
+		otpCode.setIdentifier(identifier);
+		otpCode.setOtpCode(otp);
+		otpCode.setUsed(false);
+		otpCode.setExpiresAt(LocalDateTime.now().plusMinutes(5));
 
-        // ------------------------------------------------------------
-        // SEND OTP TO EMAIL (via EmailNotification module)
-        // ------------------------------------------------------------
-        EmailSendRequest emailReq = new EmailSendRequest();
-        emailReq.setSubject("Your OTP Code");
-        emailReq.setMessage("Your OTP is: " + otp + "\n\nValid for 5 minutes.");
+		otpRepo.save(otpCode);
 
-        // email sending (simulated as SENT)
-        emailService.sendEmail(0L, emailReq); // userId = 0 because OTP can be for anyone
+		// **MOCK MODE: SHOW OTP IN CONSOLE**
+		log.info("Generated OTP for {} :’ {}", identifier, otp);
+		System.out.println("DEBUG OTP for " + identifier + " = " + otp);
 
-        return "OTP sent successfully to: " + identifier;
-    }
+		return "OTP generated successfully";
+	}
 
-    // ------------------------------------------------------------
-    // VERIFY OTP
-    // ------------------------------------------------------------
-    @Override
-    public String verifyOtp(OtpVerifyRequest request) {
+	// ------------------------------------------------------------
+	// VERIFY OTP
+	// ------------------------------------------------------------
+	@Override
+	public String verifyOtp(OtpVerifyRequest request) {
 
-        if (request.getIdentifier() == null || request.getIdentifier().isEmpty()) {
-            throw new BadRequestException("Identifier cannot be empty");
-        }
-        if (request.getOtp() == null || request.getOtp().isEmpty()) {
-            throw new BadRequestException("OTP cannot be empty");
-        }
+		if (request.getIdentifier() == null || request.getIdentifier().isEmpty()) {
+			throw new BadRequestException("Identifier cannot be empty");
+		}
+		if (request.getOtp() == null || request.getOtp().isEmpty()) {
+			throw new BadRequestException("OTP cannot be empty");
+		}
 
-        String identifier = request.getIdentifier();
-        String otpInput = request.getOtp();
+		String identifier = request.getIdentifier();
+		String otpInput = request.getOtp();
 
-        // Fetch latest valid OTP
-        OtpCode otpRecord = otpRepo.findLatestValidOtp(identifier)
-                .orElseThrow(() -> new ResourceNotFoundException("OTP not found or expired"));
+		OtpCode otpRecord = otpRepo.findLatestValidOtp(identifier)
+				.orElseThrow(() -> new ResourceNotFoundException("OTP expired or not found"));
 
-        // Check if OTP is expired
-        if (otpRecord.getExpiresAt().isBefore(LocalDateTime.now())) {
-            throw new BadRequestException("OTP expired. Please request a new one.");
-        }
+		if (otpRecord.getExpiresAt().isBefore(LocalDateTime.now())) {
+			throw new BadRequestException("OTP expired");
+		}
 
-        // Check match
-        if (!otpRecord.getOtpCode().equals(otpInput)) {
-            throw new BadRequestException("Invalid OTP");
-        }
+		if (!otpRecord.getOtpCode().equals(otpInput)) {
+			throw new BadRequestException("Invalid OTP");
+		}
 
-        // Mark as used
-        otpRepo.markOtpUsed(otpRecord.getId());
+		otpRepo.markOtpUsed(otpRecord.getId());
 
-        return "OTP verified successfully!";
-    }
+		return "OTP verified successfully!";
+	}
 }

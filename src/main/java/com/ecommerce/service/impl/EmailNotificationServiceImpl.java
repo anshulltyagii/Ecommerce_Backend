@@ -8,6 +8,8 @@ import com.ecommerce.model.EmailNotification;
 import com.ecommerce.repository.EmailNotificationRepository;
 import com.ecommerce.service.EmailNotificationService;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -16,117 +18,82 @@ import java.util.stream.Collectors;
 @Service
 public class EmailNotificationServiceImpl implements EmailNotificationService {
 
-    private final EmailNotificationRepository emailNotificationRepo;
+	private static final Logger log = LoggerFactory.getLogger(EmailNotificationServiceImpl.class);
 
-    public EmailNotificationServiceImpl(EmailNotificationRepository emailNotificationRepo) {
-        this.emailNotificationRepo = emailNotificationRepo;
-    }
+	private final EmailNotificationRepository emailRepo;
 
-    // ------------------------------------------------------------
-    // CREATE EMAIL ENTRY â†’ status = PENDING â†’ try to send â†’ update status
-    // ------------------------------------------------------------
-    @Override
-    public EmailNotificationResponse sendEmail(Long userId, EmailSendRequest request) {
+	public EmailNotificationServiceImpl(EmailNotificationRepository repo) {
+		this.emailRepo = repo;
+	}
 
-        // Validation
-        if (request.getSubject() == null || request.getSubject().trim().isEmpty()) {
-            throw new BadRequestException("Subject cannot be empty");
-        }
+	@Override
+	public EmailNotificationResponse sendEmail(Long userId, EmailSendRequest request) {
 
-        if (request.getMessage() == null || request.getMessage().trim().isEmpty()) {
-            throw new BadRequestException("Message cannot be empty");
-        }
+		if (request.getSubject() == null || request.getSubject().isBlank()) {
+			throw new BadRequestException("Subject cannot be empty");
+		}
+		if (request.getMessage() == null || request.getMessage().isBlank()) {
+			throw new BadRequestException("Message cannot be empty");
+		}
 
-        // Create Notification Object
-        EmailNotification notification = new EmailNotification();
-        notification.setUserId(userId);
-        notification.setSubject(request.getSubject());
-        notification.setMessage(request.getMessage());
-        notification.setStatus("PENDING");   // default
+		EmailNotification n = new EmailNotification();
+		n.setUserId(userId);
+		n.setSubject(request.getSubject());
+		n.setMessage(request.getMessage());
+		n.setStatus("PENDING");
 
-        // Save to database
-        Long id = emailNotificationRepo.save(notification);
-        notification.setId(id);
+		Long id = emailRepo.save(n);
+		n.setId(id);
 
-        // --------------------------------------------------------
-        // SIMULATED EMAIL SENDING (REAL SMTP WILL COME LATER)
-        // --------------------------------------------------------
-        boolean emailSentSuccessfully = true; // change later if needed
+		// ---------------------------------------------------------------------------------------
+		// MOá¸° MODE â€” Instead of sending real email, we log it
+		// ---------------------------------------------------------------------------------------
+		log.info("MOCK EMAIL â†’ USER: {}, SUBJECT: {}, MESSAGE: {}", userId, request.getSubject(),
+				request.getMessage());
 
-        if (emailSentSuccessfully) {
-            emailNotificationRepo.updateStatus(id, "SENT");
-            notification.setStatus("SENT");
-        } else {
-            emailNotificationRepo.updateStatus(id, "FAILED");
-            notification.setStatus("FAILED");
-        }
+		System.out.println("\n=== MOCK EMAIL ===");
+		System.out.println("To User: " + userId);
+		System.out.println("Subject: " + request.getSubject());
+		System.out.println("Message: " + request.getMessage());
+		System.out.println("==================\n");
 
-        return mapToResponse(notification);
-    }
+		// mark as SENT
+		emailRepo.updateStatus(id, "SENT");
+		n.setStatus("SENT");
 
-    // ------------------------------------------------------------
-    // MANUAL STATUS UPDATE
-    // ------------------------------------------------------------
-    @Override
-    public boolean updateStatus(Long notificationId, String status) {
+		return map(n);
+	}
 
-        if (!status.equals("PENDING") && !status.equals("SENT") && !status.equals("FAILED")) {
-            throw new BadRequestException("Invalid status: " + status);
-        }
+	@Override
+	public boolean updateStatus(Long id, String status) {
+		return emailRepo.updateStatus(id, status);
+	}
 
-        return emailNotificationRepo.updateStatus(notificationId, status);
-    }
+	@Override
+	public EmailNotificationResponse getNotificationById(Long id) {
+		EmailNotification n = emailRepo.findById(id)
+				.orElseThrow(() -> new ResourceNotFoundException("Email notification not found"));
+		return map(n);
+	}
 
-    // ------------------------------------------------------------
-    // GET A SINGLE EMAIL NOTIFICATION ENTRY
-    // ------------------------------------------------------------
-    @Override
-    public EmailNotificationResponse getNotificationById(Long id) {
+	@Override
+	public List<EmailNotificationResponse> getAllByUser(Long userId) {
+		return emailRepo.findAllByUser(userId).stream().map(this::map).collect(Collectors.toList());
+	}
 
-        EmailNotification notification = emailNotificationRepo.findById(id)
-                .orElseThrow(() -> new ResourceNotFoundException("Email notification not found"));
+	@Override
+	public List<EmailNotificationResponse> getAllNotifications() {
+		return emailRepo.findAll().stream().map(this::map).collect(Collectors.toList());
+	}
 
-        return mapToResponse(notification);
-    }
-
-    // ------------------------------------------------------------
-    // GET ALL EMAILS OF A USER
-    // ------------------------------------------------------------
-    @Override
-    public List<EmailNotificationResponse> getAllByUser(Long userId) {
-
-        return emailNotificationRepo.findAllByUser(userId)
-                .stream()
-                .map(this::mapToResponse)
-                .collect(Collectors.toList());
-    }
-
-    // ------------------------------------------------------------
-    // ADMIN FEATURE â†’ FETCH ALL EMAIL NOTIFICATIONS
-    // ------------------------------------------------------------
-    @Override
-    public List<EmailNotificationResponse> getAllNotifications() {
-
-        return emailNotificationRepo.findAll()
-                .stream()
-                .map(this::mapToResponse)
-                .collect(Collectors.toList());
-    }
-
-    // ------------------------------------------------------------
-    // PRIVATE MAPPER: ENTITY â†’ DTO
-    // ------------------------------------------------------------
-    private EmailNotificationResponse mapToResponse(EmailNotification e) {
-
-        EmailNotificationResponse dto = new EmailNotificationResponse();
-
-        dto.setId(e.getId());
-        dto.setUserId(e.getUserId());
-        dto.setSubject(e.getSubject());
-        dto.setMessage(e.getMessage());
-        dto.setStatus(e.getStatus());
-        dto.setCreatedAt(e.getCreatedAt());
-
-        return dto;
-    }
+	private EmailNotificationResponse map(EmailNotification n) {
+		EmailNotificationResponse r = new EmailNotificationResponse();
+		r.setId(n.getId());
+		r.setUserId(n.getUserId());
+		r.setSubject(n.getSubject());
+		r.setMessage(n.getMessage());
+		r.setStatus(n.getStatus());
+		r.setCreatedAt(n.getCreatedAt());
+		return r;
+	}
 }
